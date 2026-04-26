@@ -1,0 +1,52 @@
+# TAS-AI Conda/Mamba Environment
+#
+# For fastest installation, use mamba instead of conda:
+#   mamba env create -f environment.yml
+#   mamba activate tasai
+#
+# Or with conda (slower):
+#   conda env create -f environment.yml
+#   conda activate tasai
+
+name: tasai
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python>=3.9,<3.13
+
+  # Core scientific stack
+  - numpy>=1.20,<2.0
+  - scipy>=1.8,<1.12
+  - matplotlib>=3.4
+
+  # Dashboard dependencies
+  - dash>=2.14.0
+  - dash-bootstrap-components>=1.5.0
+  - plotly>=5.18.0
+  - pandas>=2.0.0
+
+  # API framework (for proxy server)
+  - fastapi>=0.68
+  - uvicorn>=0.15
+  - pydantic>=2.0
+  - requests>=2.25
+
+  # MCMC inference
+  - bumps>=0.8
+
+  # Machine learning (optional but recommended)
+  - scikit-learn>=1.0,<1.6
+
+  # Development/testing
+  - pytest>=6.0
+  - pytest-asyncio>=0.15
+  - httpx>=0.18
+
+  # Pip for installing tasai package
+  - pip
+
+# After activating the environment, install tasai with:
+#   pip install -e .

@@ -1,0 +1,129 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tasai"
+version = "1.0.1"
+description = "Autonomous Triple-Axis Spectroscopy using Active Learning"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "NIST Center for Neutron Research", email = "neutronscattering@nist.gov"}
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+keywords = [
+    "neutron scattering",
+    "triple-axis spectrometer",
+    "autonomous experiments",
+    "active learning",
+    "Bayesian inference",
+]
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.8,<1.23",
+    "matplotlib>=3.4",
+    "icp-lattice-calculator>=0.1.1",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "dash>=2.14.0",
+    "dash-bootstrap-components>=1.5.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+]
+server = [
+    "fastapi>=0.104.0,<0.112.0",
+    "uvicorn>=0.23",
+    "requests>=2.25",
+    "pydantic>=2.0,<3.0",
+]
+inference = [
+    "scikit-learn>=1.0",
+    "emcee>=3.1",
+]
+mcmc = [
+    "bumps>=0.8",
+]
+julia = [
+    "juliacall>=0.9",
+]
+spinwave = [
+    "pyspinw>=0.1.0",
+]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "ruff>=0.1.0",
+    "mypy>=0.9",
+]
+all = [
+    "dash>=2.14.0",
+    "dash-bootstrap-components>=1.5.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+    "fastapi>=0.68",
+    "uvicorn>=0.15",
+    "requests>=2.25",
+    "pydantic>=1.8",
+    "scikit-learn>=1.0",
+    "emcee>=3.1",
+    "bumps>=0.8",
+    "pyspinw>=0.1.0",
+]
+
+[project.scripts]
+tasai = "tasai.cli:main"
+tasai-dashboard = "tasai.dashboard.app:main"
+tasai-proxy = "tasai.proxy_server.server:main"
+
+[project.urls]
+Homepage = "https://github.com/williamratcliff-nist/tasai"
+Documentation = "https://github.com/williamratcliff-nist/tasai/tree/main/docs"
+Repository = "https://github.com/williamratcliff-nist/tasai"
+Issues = "https://github.com/williamratcliff-nist/tasai/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tasai", "tasai.*"]
+namespaces = false
+exclude = ["tests*", "scripts*", "simulations*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"tasai.sunny" = ["*.jl"]
+"tasai.dashboard" = ["requirements.txt"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
