@@ -108,3 +108,6 @@ Manifest.toml
 pyspinw_pkg/
 tasai_git_archive.zip
 tacc_runs/
+
+# Zenodo deposit tarball for the accepted version (do not track)
+/tasai-accepted-digital-discovery.tar.gz
