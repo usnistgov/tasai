@@ -142,7 +142,7 @@ class AutonomousOrderParameter:
     
     def run_inference(self, model: PhysicsModel) -> np.ndarray:
         """Run MCMC inference for a single model."""
-        runner = MCMCRunner(model, burn=300, steps=200, walkers=8)
+        runner = MCMCRunner(model, burn=300, steps=200, pop=8)
         
         # Convert data to arrays
         h = np.zeros(len(self.T_measured))
@@ -171,7 +171,7 @@ class AutonomousOrderParameter:
         
         for model in self.hypothesis_models:
             # Quick inference
-            runner = MCMCRunner(model, burn=100, steps=50, walkers=4)
+            runner = MCMCRunner(model, burn=100, steps=50, pop=4)
             chain = runner.run(h, k, l, T, I, sigma)
             
             # Use mean parameters

@@ -15,8 +15,6 @@ Reference: https://github.com/bumps/bumps
 import numpy as np
 from typing import Tuple, Optional, Dict, List, Callable
 import logging
-import tempfile
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +24,7 @@ class BumpsProblem:
     Wrapper to make a PhysicsModel compatible with BUMPS.
     
     BUMPS expects a "fitness" object with:
-    - parameters: list of bumps.Parameter
+    - parameters(): list of bumps.Parameter
     - nllf(): negative log likelihood function
     - numpoints(): number of data points
     """
@@ -58,30 +56,40 @@ class BumpsProblem:
         except ImportError:
             self._bumps_params = None
     
-    @property
     def parameters(self):
-        """Return BUMPS parameters."""
+        """Return BUMPS parameters through the fitness protocol method."""
         return self._bumps_params
     
     def numpoints(self):
         """Number of data points."""
         return len(self.I)
     
-    def nllf(self):
-        """Negative log likelihood (what BUMPS minimizes)."""
-        # Sync parameter values from BUMPS to model
+    def update(self):
+        """Synchronize the physics model after BUMPS changes its parameters."""
         for bp, mp in zip(self._bumps_params, self.model.free_parameters):
             mp.value = bp.value
-        
+
+    def nllf(self):
+        """Negative log posterior, including the physics model's priors.
+
+        BUMPS parameters enforce hard bounds; the model supplies any nonuniform
+        prior, matching the emcee and Metropolis backends.
+        """
+        self.update()
+        log_prior = self.model.log_prior()
+        if not np.isfinite(log_prior):
+            return np.inf
+
         # Compute negative log likelihood
         log_like = self.model.log_likelihood(
             self.h, self.k, self.l, self.E, self.I, self.sigma
         )
         
-        return -log_like
+        return -(log_prior + log_like)
     
     def residuals(self):
         """Residuals for least-squares fitting."""
+        self.update()
         I_pred = self.model.compute_intensity_array(self.h, self.k, self.l, self.E)
         return (self.I - I_pred) / self.sigma
 
@@ -264,152 +272,89 @@ class MCMCRunner:
         return 'metropolis'
     
     def _run_bumps(self, initial_state: np.ndarray = None) -> np.ndarray:
-        """
-        Run MCMC using BUMPS/DREAM algorithm.
-        
-        DREAM = Differential Evolution Adaptive Metropolis.
-        This is the standard MCMC algorithm for NIST autonomous systems.
-        """
+        """Run DREAM using the supported BUMPS model and sampler interfaces."""
         try:
-            from bumps.dream.core import run_dream
-            from bumps.dream.model import MCMCModel
-            from bumps.dream.state import load_state
+            from bumps.dream.core import Dream
+            from bumps.fitters import DreamModel
             from bumps.fitproblem import FitProblem
-            from bumps.parameter import Parameter as BumpsParameter
         except ImportError as e:
             logger.warning(f"BUMPS import failed: {e}, falling back to emcee")
             return self._run_emcee(initial_state)
-        
-        # Create BUMPS-compatible problem
+
         problem = BumpsProblem(
             self.model,
             self.h_data, self.k_data, self.l_data, self.E_data,
             self.I_data, self.sigma_data
         )
-        
-        # Wrap in FitProblem
         fit_problem = FitProblem(problem)
-        
-        # DREAM parameters (matching AutoREFL defaults)
         n_params = self.model.n_free
-        n_chains = self.pop * n_params  # Population size
-        
-        # Create DREAM model
-        dream_model = MCMCModel(fit_problem)
-        
-        # Initialize population
-        if initial_state is not None:
-            # Use provided initial state
-            population = initial_state[-n_chains:, :]
-        else:
-            # Initialize from prior
+        n_chains = self.pop * n_params
+        if n_params < 1 or n_chains < 1:
+            raise ValueError("DREAM requires free parameters and a positive population")
+
+        if initial_state is None:
             population = self.model.sample_prior(n_chains)
-        
-        # Set up temporary directory for DREAM state
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, 'dream_state')
-            
-            # Set up parallel mapper if requested
-            mapper = None
+        else:
+            initial_state = np.asarray(initial_state, dtype=float)
+            if (initial_state.ndim != 2 or initial_state.shape[1] != n_params
+                    or initial_state.shape[0] < n_chains):
+                raise ValueError(
+                    f"initial_state must contain at least {n_chains} rows and {n_params} columns"
+                )
+            population = initial_state[-n_chains:].copy()
+
+        # DreamModel requires a callable mapping parameter rows to negative
+        # log probabilities. Supplying it also avoids relying on its fallback.
+        mapper = lambda points: list(map(fit_problem.nllf, points))
+        parallel_mapper = None
+        mapper_class = None
+        try:
             if self.parallel:
                 try:
                     from bumps.mapper import MPMapper, can_pickle
-                    import multiprocessing
-                    
-                    # Determine number of workers
-                    if isinstance(self.parallel, int):
-                        n_workers = self.parallel
-                    else:
-                        n_workers = multiprocessing.cpu_count()
-                    
-                    # Check if problem can be pickled (required for multiprocessing)
                     if can_pickle(fit_problem):
-                        mapper = MPMapper.start_mapper(fit_problem, None, cpus=n_workers)
-                        logger.info(f"BUMPS using {n_workers} parallel workers")
+                        # bool is an int subclass; True means all available CPUs.
+                        n_workers = (self.parallel if isinstance(self.parallel, int)
+                                     and not isinstance(self.parallel, bool) else 0)
+                        mapper_class = MPMapper
+                        parallel_mapper = MPMapper.start_mapper(fit_problem, None, cpus=n_workers)
+                        mapper = parallel_mapper
                     else:
                         logger.warning("Problem cannot be pickled, running serial")
                 except Exception as e:
+                    # start_mapper can allocate a pool before failing to serialize.
+                    if mapper_class is not None:
+                        mapper_class.stop_mapper(parallel_mapper)
+                        mapper_class = None
                     logger.warning(f"Parallel mapper setup failed: {e}, running serial")
-            
-            # Run DREAM
+
             logger.info(f"Running DREAM with {n_chains} chains...")
-            
-            state = run_dream(
-                dream_model,
-                population=population,
-                burn=self.burn,
-                steps=self.steps,
-                thin=1,
-                # Additional DREAM options
+            sampler = Dream(
+                model=DreamModel(fit_problem, mapper=mapper),
+                population=np.asarray(population, dtype=float)[None, :, :],
+                draws=n_chains * self.steps,
+                burn=n_chains * self.burn,
+                thinning=1,
                 DE_noise=1e-6,
                 outlier_test='IQR',
-                mapper=mapper,
             )
-            
-            # Store state for later analysis
+            state = sampler.sample()
+            state.mark_outliers()
             self.dream_state = state
-            
-            # Cleanup parallel mapper
-            if mapper is not None:
-                try:
-                    mapper.stop_mapper()
-                except:
-                    pass
-            
-            # Extract chain (all samples after burn-in)
-            # DREAM returns shape (n_steps, n_chains, n_params)
-            draws = state.draw()
-            
-            # Flatten to (n_samples, n_params)
-            chain = draws.reshape(-1, n_params)
-            
-            # Also extract log probabilities
-            self.log_prob = -state.logp().flatten()  # DREAM stores -logp
-        
-        return chain
-    
+            draw = state.draw()
+            # Draw carries aligned samples/log probabilities. Its logp already
+            # has the posterior sign; it is not a negative-log-likelihood array.
+            chain = np.asarray(draw.points).copy()
+            self.log_prob = np.asarray(draw.logp).copy()
+            return chain
+        finally:
+            if mapper_class is not None:
+                mapper_class.stop_mapper(parallel_mapper)
+
     def _run_bumps_simple(self, initial_state: np.ndarray = None) -> np.ndarray:
-        """
-        Simplified BUMPS/DREAM run using bumps.fitters.
-        
-        This is an alternative approach using the higher-level bumps API.
-        """
-        try:
-            from bumps.fitters import fit, DreamFit
-            from bumps.fitproblem import FitProblem
-        except ImportError:
-            logger.warning("BUMPS not available, falling back to emcee")
-            return self._run_emcee(initial_state)
-        
-        # Create problem
-        problem = BumpsProblem(
-            self.model,
-            self.h_data, self.k_data, self.l_data, self.E_data,
-            self.I_data, self.sigma_data
-        )
-        
-        fit_problem = FitProblem(problem)
-        
-        # Run DREAM fit
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = fit(
-                fit_problem,
-                method='dream',
-                burn=self.burn,
-                steps=self.steps,
-                pop=self.pop,
-                store=tmpdir
-            )
-            
-            # Load state to get chain
-            from bumps.dream.state import load_state
-            state = load_state(os.path.join(tmpdir, 'model'))
-            
-            draws = state.draw()
-            chain = draws.reshape(-1, self.model.n_free)
-        
-        return chain
-    
+        """Compatibility entry point using the same supported DREAM wiring."""
+        return self._run_bumps(initial_state)
+
     def _run_emcee(self, initial_state: np.ndarray = None) -> np.ndarray:
         """
         Run MCMC using emcee with optional parallelization.
@@ -610,7 +555,7 @@ def compute_bayes_factor(model1: 'PhysicsModel',
     def log_marginal_likelihood(model: 'PhysicsModel') -> float:
         """Estimate log marginal likelihood via harmonic mean."""
         # Run short MCMC
-        runner = MCMCRunner(model, burn=200, steps=n_samples // 10, walkers=8)
+        runner = MCMCRunner(model, burn=200, steps=n_samples // 10, pop=8)
         runner.set_data(h, k, l, E, I, sigma)
         chain = runner.run()
         

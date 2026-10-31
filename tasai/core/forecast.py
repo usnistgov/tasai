@@ -23,8 +23,9 @@ future measurements are predicted from existing measurements."
 """
 
 import numpy as np
-from typing import List, Tuple, Optional, Callable, Dict, Any
+from typing import List, Tuple, Optional, Callable, Dict, Any, Protocol
 from dataclasses import dataclass, field
+from enum import Enum
 import logging
 
 logger = logging.getLogger(__name__)
@@ -35,11 +36,40 @@ class ForecastPoint:
     """A forecasted measurement point with metadata."""
     point: Any  # MeasurementPoint or similar
     score: float  # Acquisition function score
-    expected_intensity: float  # Predicted intensity
-    expected_uncertainty: float  # Predicted uncertainty
+    expected_intensity: Any  # Scalar intensity or vector observation mean
+    expected_uncertainty: Any  # Scalar error or vector marginal standard deviations
     count_time: float  # Optimal counting time
     cumulative_info_gain: float = 0.0  # Running total of information gain
     forecast_step: int = 0  # Which step in forecast sequence
+    expected_covariance: Optional[np.ndarray] = None
+    movement_time: float = 0.0
+    effective_sample_size: Optional[float] = None
+
+
+class ForecastStopReason(str, Enum):
+    COMPLETED = "completed"
+    NO_CANDIDATES = "no_candidates"
+    MINIMUM_INFORMATION_GAIN = "minimum_information_gain"
+    LOW_EFFECTIVE_SAMPLE_SIZE = "low_effective_sample_size"
+
+
+class GaussianObservationAdapter(Protocol):
+    """Vector observations for the existing mean-outcome forecasting policy.
+
+    Predictions retain all N full parameter particles and have shape (N, k).
+    Covariance is the full k-by-k Gaussian observation covariance, including
+    fitted nuisance-parameter effects; it is not posterior prediction covariance.
+    Count time is the whole observation's duration in seconds. Movement and
+    settling remain in movement_time_func, avoiding double counting.
+    """
+
+    def predict(self, samples: np.ndarray, candidate: Any) -> np.ndarray: ...
+
+    def covariance(self, candidate: Any, count_time: float,
+                   predictions: np.ndarray, weights: np.ndarray) -> np.ndarray: ...
+
+    def count_time(self, candidate: Any, predictions: np.ndarray,
+                   weights: np.ndarray) -> float: ...
 
 
 @dataclass
@@ -49,7 +79,16 @@ class ForecastResult:
     initial_entropy: float
     final_entropy: float
     total_info_gain: float
-    posterior_samples: np.ndarray  # Final updated posterior
+    posterior_samples: np.ndarray  # Compatibility name: hypothetical, never measured evidence
+    posterior_kind: str = "hypothetical_mean_outcome"
+    stop_reason: ForecastStopReason = ForecastStopReason.COMPLETED
+    requires_posterior_refresh: bool = False
+    stop_details: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def hypothetical_posterior_samples(self) -> np.ndarray:
+        """Explicit name for the forecast-only resampled particles."""
+        return self.posterior_samples
 
 
 class Forecaster:
@@ -69,7 +108,10 @@ class Forecaster:
                  max_count_time: float = 600.0,
                  movement_time_func: Callable = None,
                  noise_model: str = 'poisson',
-                 background_rate: float = 0.0):
+                 background_rate: float = 0.0,
+                 observation_adapter: Optional[GaussianObservationAdapter] = None,
+                 rng: Optional[np.random.Generator] = None,
+                 min_effective_sample_size: Optional[float] = None):
         """
         Initialize forecaster.
         
@@ -91,6 +133,15 @@ class Forecaster:
             'poisson' or 'gaussian' for measurement noise model
         background_rate : float
             Background count rate (counts/second)
+        observation_adapter : GaussianObservationAdapter, optional
+            Supplies vector predictions, full observation covariance and duration.
+            Uses the same posterior-mean pseudo-observation and entropy/time rule.
+            Adapter durations are validated, not clipped to scalar counting bounds.
+        rng : numpy.random.Generator, optional
+            Seeded random generator for forecasting resampling. None uses np.random.
+        min_effective_sample_size : float, optional
+            Stop before accepting a winning update below this absolute particle ESS.
+            Defaults to 10 for vector observations; disabled for the historical scalar path.
         """
         self.physics_model = physics_model
         self.candidate_generator = candidate_generator
@@ -101,6 +152,18 @@ class Forecaster:
         self.movement_time_func = movement_time_func or (lambda a, b: 30.0)
         self.noise_model = noise_model
         self.background_rate = background_rate
+        self.observation_adapter = observation_adapter
+        # None preserves np.random.seed compatibility for the historical path.
+        self.rng = rng if rng is not None else np.random
+        # Preserve historical scalar selection by default; vector observations
+        # guard against particle collapse unless an explicit threshold is given.
+        self.min_effective_sample_size = (
+            10.0 if observation_adapter is not None and min_effective_sample_size is None
+            else min_effective_sample_size
+        )
+        if self.min_effective_sample_size is not None:
+            if not np.isfinite(self.min_effective_sample_size) or self.min_effective_sample_size <= 0:
+                raise ValueError("min_effective_sample_size must be finite and positive")
     
     def forecast(self,
                  posterior_samples: np.ndarray,
@@ -126,13 +189,12 @@ class Forecaster:
         ForecastResult
             Forecasted points and associated metadata
         """
-        from .entropy import (
-            differential_entropy, expected_information_gain,
-            gaussian_log_likelihood, resample_posterior
-        )
+        from .entropy import differential_entropy, gaussian_log_likelihood
         
         # Working copies
-        samples = posterior_samples.copy()
+        samples = np.array(posterior_samples, dtype=float, copy=True)
+        if samples.ndim != 2 or len(samples) < 2 or samples.shape[1] == 0 or not np.all(np.isfinite(samples)):
+            raise ValueError("posterior_samples must be a finite (N, parameters) array with N>=2")
         weights = np.ones(len(samples)) / len(samples)
         position = current_position
         
@@ -147,7 +209,10 @@ class Forecaster:
         
         forecasted_points = []
         cumulative_info_gain = 0.0
-        
+        stop_reason = ForecastStopReason.COMPLETED
+        stop_details = {}
+        requires_posterior_refresh = False
+
         logger.info(f"Starting forecast: {n_forecast} points, H_initial={initial_entropy:.3f}")
         
         for step in range(n_forecast):
@@ -156,6 +221,7 @@ class Forecaster:
             
             if not candidates:
                 logger.warning("No candidates generated, stopping forecast")
+                stop_reason = ForecastStopReason.NO_CANDIDATES
                 break
             
             # Score each candidate
@@ -165,37 +231,39 @@ class Forecaster:
             
             for candidate in candidates:
                 # Movement time
-                if position is not None:
+                if position is not None or self.observation_adapter is not None:
                     t_move = self.movement_time_func(position, candidate)
                 else:
                     t_move = 30.0
                 
-                # Predict intensity for each posterior sample
-                predictions = self._predict_intensities(samples, candidate)
-                
-                # Expected intensity (posterior mean)
-                I_expected = np.average(predictions, weights=weights)
-                I_std = np.sqrt(np.average((predictions - I_expected)**2, weights=weights))
-                
-                # Optimal count time
-                t_count = self._optimal_count_time(I_expected, I_std)
-                
-                # Expected measurement uncertainty
-                sigma_meas = self._measurement_uncertainty(I_expected, t_count)
-                
-                # Expected information gain (using importance sampling)
-                # Assume we'll measure something close to I_expected
-                log_likes = gaussian_log_likelihood(predictions, I_expected, sigma_meas)
-                
+                if self.observation_adapter is None:
+                    # Historical scalar policy: preserve its mean-outcome noise,
+                    # count-time estimate and likelihood without alteration.
+                    predictions = self._predict_intensities(samples, candidate)
+                    I_expected = np.average(predictions, weights=weights)
+                    I_std = np.sqrt(np.average((predictions - I_expected)**2, weights=weights))
+                    t_count = self._optimal_count_time(I_expected, I_std)
+                    sigma_meas = self._measurement_uncertainty(I_expected, t_count)
+                    log_likes = gaussian_log_likelihood(predictions, I_expected, sigma_meas)
+                    observation_covariance = None
+                else:
+                    predictions, I_expected, observation_covariance, t_count, log_likes = (
+                        self._vector_observation(samples, candidate, weights)
+                    )
+                    sigma_meas = np.sqrt(np.diag(observation_covariance))
+                    if not np.isfinite(t_move) or t_move < 0:
+                        raise ValueError("movement_time_func must return finite nonnegative seconds")
+
                 # Compute new weights
                 new_log_weights = np.log(weights + 1e-300) + log_likes
                 new_log_weights -= np.max(new_log_weights)
                 new_weights = np.exp(new_log_weights)
                 new_weights /= np.sum(new_weights)
-                
+                ess = float(1.0 / np.sum(new_weights**2))
+
                 # Entropy of reweighted posterior
                 n_resample = min(len(samples), 500)
-                indices = np.random.choice(len(samples), n_resample, p=new_weights, replace=True)
+                indices = self.rng.choice(len(samples), n_resample, p=new_weights, replace=True)
                 resampled = samples[indices]
                 
                 if self.poi_indices is not None:
@@ -225,10 +293,25 @@ class Forecaster:
                         'H_after': H_after,
                         'new_weights': new_weights,
                         'predictions': predictions,
-                        'log_likes': log_likes
+                        'log_likes': log_likes,
+                        'covariance': observation_covariance,
+                        'effective_sample_size': ess
                     }
             
+            # Do not reset collapsed weights or claim an unreliable forecast.
+            # Previously accepted steps remain explicitly hypothetical; actual
+            # measurements must provide the posterior refresh.
+            if (best_info is not None and self.min_effective_sample_size is not None
+                    and best_info['effective_sample_size'] < self.min_effective_sample_size):
+                stop_reason = ForecastStopReason.LOW_EFFECTIVE_SAMPLE_SIZE
+                requires_posterior_refresh = True
+                stop_details = {'forecast_step': step,
+                                'effective_sample_size': best_info['effective_sample_size'],
+                                'threshold': self.min_effective_sample_size}
+                logger.warning("Stopping forecast before low-ESS update: %s", stop_details)
+                break
             if best_point is None or best_info['info_gain'] < min_info_gain:
+                stop_reason = ForecastStopReason.MINIMUM_INFORMATION_GAIN
                 logger.info(f"Stopping forecast at step {step}: info_gain={best_info['info_gain'] if best_info else 0:.4f}")
                 break
             
@@ -242,7 +325,10 @@ class Forecaster:
                 expected_uncertainty=best_info['sigma_meas'],
                 count_time=best_info['t_count'],
                 cumulative_info_gain=cumulative_info_gain,
-                forecast_step=step
+                forecast_step=step,
+                expected_covariance=best_info['covariance'],
+                movement_time=best_info['t_move'],
+                effective_sample_size=best_info['effective_sample_size']
             )
             forecasted_points.append(forecast_point)
             
@@ -260,17 +346,50 @@ class Forecaster:
         
         # Final resampled posterior
         n_final = min(len(samples), 1000)
-        final_indices = np.random.choice(len(samples), n_final, p=weights, replace=True)
+        final_indices = self.rng.choice(len(samples), n_final, p=weights, replace=True)
         final_samples = samples[final_indices]
+        if requires_posterior_refresh and not forecasted_points:
+            # No hypothetical update was accepted; return the unchanged copy.
+            final_samples = samples.copy()
         
         return ForecastResult(
             points=forecasted_points,
             initial_entropy=initial_entropy,
             final_entropy=current_entropy,
             total_info_gain=cumulative_info_gain,
-            posterior_samples=final_samples
+            posterior_samples=final_samples,
+            stop_reason=stop_reason,
+            requires_posterior_refresh=requires_posterior_refresh,
+            stop_details=stop_details
         )
-    
+
+    def _vector_observation(self, samples, candidate, weights):
+        """Generalize the scalar Gaussian mean-outcome update without a new utility."""
+        adapter = self.observation_adapter
+        predictions = np.asarray(adapter.predict(samples, candidate), dtype=float)
+        if (predictions.ndim != 2 or predictions.shape[0] != len(samples)
+                or predictions.shape[1] == 0 or not np.all(np.isfinite(predictions))):
+            raise ValueError("adapter.predict must return a finite (N, k) observation array")
+        count_time = float(adapter.count_time(candidate, predictions, weights))
+        if not np.isfinite(count_time) or count_time <= 0:
+            raise ValueError("adapter.count_time must return finite positive seconds")
+        covariance = np.array(adapter.covariance(candidate, count_time, predictions, weights),
+                              dtype=float, copy=True)
+        k = predictions.shape[1]
+        if (covariance.shape != (k, k) or not np.all(np.isfinite(covariance))
+                or not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-12)):
+            raise ValueError("adapter.covariance must return a finite symmetric (k, k) matrix")
+        try:
+            chol = np.linalg.cholesky(covariance)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("observation covariance must be positive definite") from exc
+        expected = np.average(predictions, axis=0, weights=weights)
+        whitened = np.linalg.solve(chol, (predictions - expected).T)
+        # The Gaussian normalization is constant across particles and cancels
+        # when weights are normalized. Retain off-diagonal observation terms.
+        log_likes = -0.5 * np.sum(whitened**2, axis=0)
+        return predictions, expected, covariance, count_time, log_likes
+
     def _predict_intensities(self, 
                               samples: np.ndarray,
                               point: Any) -> np.ndarray:
@@ -440,7 +559,7 @@ class ExperimentRunner:
     
     def run_inference(self) -> np.ndarray:
         """Run MCMC inference on current data."""
-        from .mcmc import MCMCRunner
+        from ..inference.mcmc import MCMCRunner
         
         h, k, l, E, I, sigma = self.get_data_arrays()
         
